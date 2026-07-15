@@ -41,7 +41,7 @@ openssl x509 -req -in bundle_server.csr -CA bundle_root.cert -CAkey bundle_root.
 # create bundle
 cat bundle_server.cert bundle_root.cert > bundle.crt
 
-# generate pfx 
-openssl pkcs12 -export -out bundle_pfx.crt -in bundle.crt -inkey bundle_root.key -passout pass:
+# generate pfx (leaf key must match first cert in the bundle)
+openssl pkcs12 -export -out bundle_pfx.crt -in bundle.crt -inkey bundle_server.key -passout pass:
 
 popd

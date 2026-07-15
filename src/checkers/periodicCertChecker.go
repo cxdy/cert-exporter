@@ -50,6 +50,10 @@ type PeriodicCertChecker struct {
 	excludeCertGlobs []*certGlob
 	nodeName         string
 	exporter         exporters.Exporter
+	// lastDiscovered is this checker's previous contribution to the shared
+	// metrics.Discovered gauge. Each checker adjusts the gauge by delta so
+	// concurrent cert and kubeconfig checkers accumulate instead of overwrite.
+	lastDiscovered float64
 }
 
 // NewCertChecker is a factory method that returns a new PeriodicCertChecker
@@ -80,21 +84,25 @@ func (p *PeriodicCertChecker) StartChecking() {
 	periodChannel := time.Tick(p.period)
 
 	for {
-		slog.Info("Begin periodic check")
-
-		p.exporter.ResetMetrics()
-
-		for _, match := range p.getMatches() {
-			slog.Info("Publishing node metrics", "nodeName", p.nodeName, "match", match)
-
-			err := p.exporter.ExportMetrics(match, p.nodeName)
-			if err != nil {
-				metrics.ErrorTotal.Inc()
-				slog.Error("Error exporting metrics", "match", match, "error", err)
-			}
-		}
-
+		p.checkOnce()
 		<-periodChannel
+	}
+}
+
+// checkOnce performs a single scan-and-export cycle (used by tests without leaking a goroutine).
+func (p *PeriodicCertChecker) checkOnce() {
+	slog.Info("Begin periodic check")
+
+	p.exporter.ResetMetrics()
+
+	for _, match := range p.getMatches() {
+		slog.Info("Publishing node metrics", "nodeName", p.nodeName, "match", match)
+
+		err := p.exporter.ExportMetrics(match, p.nodeName)
+		if err != nil {
+			metrics.ErrorTotal.Inc()
+			slog.Error("Error exporting metrics", "match", match, "error", err)
+		}
 	}
 }
 
@@ -130,7 +138,12 @@ func (p *PeriodicCertChecker) getMatches() []string {
 		}
 	}
 
-	metrics.Discovered.Set(float64(len(set)))
+	// Adjust the shared gauge by this checker's contribution only. Using Set
+	// here would race with other PeriodicCertChecker goroutines (e.g. cert +
+	// kubeconfig) and leave the metric at whichever finished last.
+	n := float64(len(set))
+	metrics.Discovered.Add(n - p.lastDiscovered)
+	p.lastDiscovered = n
 
 	res := make([]string, len(set))
 	i := 0

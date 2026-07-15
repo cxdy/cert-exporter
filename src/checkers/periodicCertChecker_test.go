@@ -3,6 +3,7 @@ package checkers
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -130,23 +131,12 @@ func TestPeriodicCertChecker_StartChecking(t *testing.T) {
 	testutil.WriteCertToFile(t, cert1.CertPEM, filepath.Join(tmpDir, "cert1.crt"))
 	testutil.WriteCertToFile(t, cert2.CertPEM, filepath.Join(tmpDir, "cert2.crt"))
 
-	// Create checker with short period
 	includeGlobs := []string{tmpDir + "/*.crt"}
 	excludeGlobs := []string{}
-	checker := NewCertChecker(100*time.Millisecond, includeGlobs, excludeGlobs, "test-node", &exporters.CertExporter{})
+	checker := NewCertChecker(time.Hour, includeGlobs, excludeGlobs, "test-node", &exporters.CertExporter{})
 
-	// Start checking in a goroutine
-	done := make(chan bool)
-	go func() {
-		// Run for a short time
-		time.Sleep(250 * time.Millisecond)
-		done <- true
-	}()
-
-	go checker.StartChecking()
-
-	// Wait for checker to run at least once
-	time.Sleep(150 * time.Millisecond)
+	// Run a single check cycle (avoids leaking a forever-running StartChecking goroutine)
+	checker.checkOnce()
 
 	// Verify metrics were created
 	mfs, err := testRegistry.Gather()
@@ -169,13 +159,91 @@ func TestPeriodicCertChecker_StartChecking(t *testing.T) {
 	if !foundMetrics {
 		t.Errorf("Expected to find metrics for 2 certificates, found %d", metricCount)
 	}
+}
 
-	<-done
+func TestPeriodicCertChecker_DiscoveredAccumulation(t *testing.T) {
+	testRegistry := prometheus.NewRegistry()
+	metrics.Init(true, testRegistry)
+	// Discovered is a process-global gauge; zero it so this test is isolated.
+	metrics.Discovered.Set(0)
+
+	tmpDir := testutil.CreateTempCertDir(t)
+
+	cert := testutil.GenerateCertificate(t, testutil.CertConfig{
+		CommonName: "disc-test", Organization: "org", Country: "US", Province: "CA", Days: 30,
+	})
+	testutil.WriteCertToFile(t, cert.CertPEM, filepath.Join(tmpDir, "a.crt"))
+	testutil.WriteCertToFile(t, cert.CertPEM, filepath.Join(tmpDir, "b.crt"))
+	// Second checker watches a different glob (mirrors cert + kubeconfig in main).
+	testutil.WriteCertToFile(t, cert.CertPEM, filepath.Join(tmpDir, "extra.pem"))
+
+	checkerA := NewCertChecker(
+		time.Hour,
+		[]string{tmpDir + "/*.crt"},
+		[]string{},
+		"node",
+		&exporters.CertExporter{},
+	)
+	checkerB := NewCertChecker(
+		time.Hour,
+		[]string{tmpDir + "/*.pem"},
+		[]string{},
+		"node",
+		&exporters.CertExporter{},
+	)
+
+	// Both checkers contribute: 2 .crt + 1 .pem = 3 (not a racey overwrite of 2 or 1).
+	checkerA.checkOnce()
+	checkerB.checkOnce()
+	if got := gatherDiscovered(t, testRegistry); got != 3 {
+		t.Fatalf("after both checkers: discovered = %v, want 3", got)
+	}
+
+	// Re-running must not double-count (delta adjustment).
+	checkerA.checkOnce()
+	checkerB.checkOnce()
+	if got := gatherDiscovered(t, testRegistry); got != 3 {
+		t.Fatalf("after re-run: discovered = %v, want 3", got)
+	}
+
+	// Removing a file updates the total by this checker's delta only.
+	if err := os.Remove(filepath.Join(tmpDir, "b.crt")); err != nil {
+		t.Fatal(err)
+	}
+	checkerA.checkOnce()
+	if got := gatherDiscovered(t, testRegistry); got != 2 {
+		t.Fatalf("after removing one cert: discovered = %v, want 2", got)
+	}
+}
+
+func gatherDiscovered(t *testing.T, reg *prometheus.Registry) float64 {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() == "cert_exporter_discovered" && len(mf.GetMetric()) > 0 {
+			return mf.GetMetric()[0].GetGauge().GetValue()
+		}
+	}
+	t.Fatal("cert_exporter_discovered not found")
+	return 0
 }
 
 func TestPeriodicCertChecker_ErrorHandling(t *testing.T) {
 	testRegistry := prometheus.NewRegistry()
 	metrics.Init(true, testRegistry)
+
+	// Capture error_total before this test; the counter is process-global.
+	var errorCountBefore float64
+	if mfs, err := testRegistry.Gather(); err == nil {
+		for _, mf := range mfs {
+			if mf.GetName() == "cert_exporter_error_total" && len(mf.GetMetric()) > 0 {
+				errorCountBefore = mf.GetMetric()[0].GetCounter().GetValue()
+			}
+		}
+	}
 
 	tmpDir := testutil.CreateTempCertDir(t)
 
@@ -185,79 +253,61 @@ func TestPeriodicCertChecker_ErrorHandling(t *testing.T) {
 	})
 	testutil.WriteCertToFile(t, cert.CertPEM, filepath.Join(tmpDir, "valid.crt"))
 
-	// Create an invalid certificate file
+	// Create an invalid certificate file (plaintext garbage — not PEM or PKCS#12)
 	invalidFile := filepath.Join(tmpDir, "invalid.crt")
 	err := os.WriteFile(invalidFile, []byte("not a valid certificate"), 0644)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Create checker
 	includeGlobs := []string{tmpDir + "/*.crt"}
-	nodeName := "test-node-error-" + tmpDir[len(tmpDir)-10:] // unique node name
-	checker := NewCertChecker(100*time.Millisecond, includeGlobs, []string{}, nodeName, &exporters.CertExporter{})
+	nodeName := "test-node-error-" + filepath.Base(tmpDir)
+	checker := NewCertChecker(time.Hour, includeGlobs, []string{}, nodeName, &exporters.CertExporter{})
 
-	// Start checking
-	go checker.StartChecking()
+	// Single synchronous cycle: invalid cert should error, valid cert should still export
+	checker.checkOnce()
 
-	// Poll for metrics with timeout (allows time for async processing)
-	maxWait := 500 * time.Millisecond
-	checkInterval := 50 * time.Millisecond
-	deadline := time.Now().Add(maxWait)
+	mfs, err := testRegistry.Gather()
+	if err != nil {
+		t.Fatalf("Failed to gather metrics: %v", err)
+	}
 
 	var errorCount float64
 	var validMetricFound bool
-
-	for time.Now().Before(deadline) {
-		mfs, err := testRegistry.Gather()
-		if err != nil {
-			t.Fatalf("Failed to gather metrics: %v", err)
-		}
-
-		// Check error count
-		for _, mf := range mfs {
-			if mf.GetName() == "cert_exporter_error_total" {
-				if len(mf.GetMetric()) > 0 {
-					errorCount = mf.GetMetric()[0].GetCounter().GetValue()
-				}
-				break
+	for _, mf := range mfs {
+		switch mf.GetName() {
+		case "cert_exporter_error_total":
+			if len(mf.GetMetric()) > 0 {
+				errorCount = mf.GetMetric()[0].GetCounter().GetValue()
 			}
-		}
-
-		// Check for valid certificate metric
-		validMetricFound = false
-		for _, mf := range mfs {
-			if mf.GetName() == "cert_exporter_cert_expires_in_seconds" {
-				for _, metric := range mf.GetMetric() {
-					labels := make(map[string]string)
-					for _, label := range metric.GetLabel() {
-						labels[label.GetName()] = label.GetValue()
-					}
-					if labels["cn"] == "valid-cert" && labels["nodename"] == nodeName {
-						validMetricFound = true
-						break
-					}
+		case "cert_exporter_cert_expires_in_seconds":
+			for _, metric := range mf.GetMetric() {
+				labels := make(map[string]string)
+				for _, label := range metric.GetLabel() {
+					labels[label.GetName()] = label.GetValue()
 				}
-				if validMetricFound {
-					break
+				if labels["cn"] == "valid-cert" && labels["nodename"] == nodeName {
+					validMetricFound = true
 				}
 			}
 		}
-
-		// If we have both error count and valid metric, we're done
-		if errorCount >= 1 && validMetricFound {
-			break
-		}
-
-		time.Sleep(checkInterval)
 	}
 
-	// Should have at least one error from the invalid certificate
-	if errorCount < 1 {
-		t.Errorf("Expected error_total >= 1, got %v", errorCount)
+	if errorCount < errorCountBefore+1 {
+		t.Errorf("Expected error_total to increase by at least 1 (before=%v, after=%v)", errorCountBefore, errorCount)
 	}
 
 	if !validMetricFound {
 		t.Error("Expected to find metrics for valid certificate despite error in invalid certificate")
+	}
+
+	// Also verify ExportMetrics surfaces a stable parse failure for invalid text
+	// (not a brittle PKCS#12 ASN.1 detail that changes across crypto/asn1 versions).
+	exportErr := (&exporters.CertExporter{}).ExportMetrics(invalidFile, nodeName)
+	if exportErr == nil {
+		t.Fatal("Expected ExportMetrics to fail for invalid certificate text")
+	}
+	if !strings.Contains(exportErr.Error(), "failed to parse as pem and pkcs12") {
+		t.Errorf("Expected parse failure wrapper, got: %v", exportErr)
 	}
 }
