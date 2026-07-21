@@ -17,7 +17,9 @@ var (
 		},
 	)
 
-	// Discovered is a prometheus guage that indicates the sum of discovered certificates after taking into account include and exclude globs
+	// Discovered is a prometheus gauge for the number of files matched by
+	// include/exclude globs across all file-based checkers (certs, kubeconfigs).
+	// Concurrent checkers adjust it by delta rather than overwriting.
 	Discovered = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: namespace,

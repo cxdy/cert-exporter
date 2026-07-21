@@ -41,16 +41,30 @@ func secondsToExpiryFromCertAsBase64String(s string) ([]certMetric, error) {
 func secondsToExpiryFromCertAsBytes(certBytes []byte, certPassword string) ([]certMetric, error) {
 	var metrics []certMetric
 
-	parsed, metrics, err := parseAsPEM(certBytes)
+	parsed, metrics, pemErr := parseAsPEM(certBytes)
 	if parsed {
-		return metrics, err
+		return metrics, pemErr
 	}
-	// Parse as PKCS ?
-	parsed, metrics, err = parseAsPKCS(certBytes, certPassword)
+	// Fall back to PKCS#12 for binary keystore formats (.p12/.pfx).
+	parsed, metrics, pkcsErr := parseAsPKCS(certBytes, certPassword)
 	if parsed {
 		return metrics, nil
 	}
-	return nil, fmt.Errorf("failed to parse as pem and pkcs12: %w", err)
+	// Prefer the PEM error when the payload is clearly textual; PKCS#12 ASN.1
+	// errors on garbage text are noisy and change across crypto/asn1 versions.
+	if pemErr != nil && !looksLikePKCS12(certBytes) {
+		return nil, fmt.Errorf("failed to parse as pem and pkcs12: %w", pemErr)
+	}
+	if pkcsErr != nil {
+		return nil, fmt.Errorf("failed to parse as pem and pkcs12: %w", pkcsErr)
+	}
+	return nil, fmt.Errorf("failed to parse as pem and pkcs12")
+}
+
+// looksLikePKCS12 reports whether data might be a PKCS#12/PFX binary.
+// PKCS#12 is an ASN.1 SEQUENCE (tag 0x30); PEM text never starts that way.
+func looksLikePKCS12(data []byte) bool {
+	return len(data) > 0 && data[0] == 0x30
 }
 
 func getCertificateMetrics(cert *x509.Certificate) certMetric {

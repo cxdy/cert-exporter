@@ -81,7 +81,7 @@ cert_exporter_certrequest_not_before_timestamp{cert_request="example-crt-gn762",
 ```
 
 **cert_exporter_discovered**
-The number of discovered certs after the include and exclude globs are factored in. The `nodename` can be used as a label to compare values.
+The number of files matched by include/exclude globs across all file-based checkers (certificate files and kubeconfig files). Concurrent checkers accumulate into this gauge rather than overwriting it.
 
 **cert_exporter_error_total**  
 The total number of unexpected errors encountered by cert-exporter.  A good metric to watch to feel comfortable certs are being exported properly.
